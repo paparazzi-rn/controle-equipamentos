@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const developmentPreviewMeta =
@@ -30,4 +31,31 @@ test("renders development preview metadata", async () => {
     /^text\/html\b/i,
   );
   assert.match(await response.text(), developmentPreviewMeta);
+});
+
+test("keeps the requested management controls in the authenticated application", async () => {
+  const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+
+  for (const label of [
+    "Buscar loja por nome, cidade ou estado",
+    "Editar todas as informações",
+    "Confirmar migração de loja?",
+    "Gerenciar e editar tipos",
+    "Código compartilhado da nota (#)",
+    "Pré-visualizar",
+    "Log de auditoria",
+    "Exportar CSV",
+  ]) {
+    assert.match(source, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
+test("database migration defines an append-only audited history", async () => {
+  const migration = await readFile(new URL("../supabase/migrations/20261013113000_add_audit_and_shared_invoices.sql", import.meta.url), "utf8");
+
+  assert.match(migration, /create table public\.audit_logs/i);
+  assert.match(migration, /revoke all on table public\.audit_logs from anon, authenticated/i);
+  assert.match(migration, /grant select on table public\.audit_logs to authenticated/i);
+  assert.match(migration, /create trigger equipments_capture_audit/i);
+  assert.match(migration, /add column reference_code text/i);
 });

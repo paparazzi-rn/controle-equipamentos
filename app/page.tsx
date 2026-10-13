@@ -1,13 +1,26 @@
 "use client";
 
+/* Blob URLs are local authenticated previews and cannot use Next's image optimizer. */
+/* eslint-disable @next/next/no-img-element */
+
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { authorizedEmail, documentsBucket, supabase } from "./supabase";
 
 type Store = { id: number; name: string; state: string; city: string; address?: string };
-type Attachment = { id: string; name: string; type: string; size: number; kind: "Nota fiscal" | "Garantia estendida"; path?: string };
+type EquipmentType = { id: number; name: string };
+type Attachment = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  kind: "Nota fiscal" | "Garantia estendida";
+  path?: string;
+  referenceCode?: string;
+};
 type Equipment = {
   id: number;
   name: string;
+  typeId: number;
   type: string;
   storeId: number;
   serial: string;
@@ -21,23 +34,33 @@ type Equipment = {
   active: boolean;
   attachments: Attachment[];
 };
+type AuditLog = {
+  id: number;
+  action: "INSERT" | "UPDATE" | "DELETE";
+  entityType: string;
+  entityId: string;
+  entityLabel: string;
+  actorEmail: string;
+  oldValues: Record<string, unknown> | null;
+  newValues: Record<string, unknown> | null;
+  createdAt: string;
+};
+type ModalName = "equipment" | "store" | "types" | "details" | null;
 
-const storesSeed: Store[] = [
-  { id: 1, name: "Loja Aram", state: "RN", city: "Natal" },
-  { id: 2, name: "Loja Enotel", state: "PE", city: "Porto de Galinhas" },
-  { id: 3, name: "Loja Vila do Mar", state: "RN", city: "Natal" },
-  { id: 4, name: "Loja The Westin", state: "PB", city: "João Pessoa" },
-];
+const navItems = ["Visão geral", "Lojas", "Equipamentos", "Garantias", "Inativos", "Auditoria"];
+const allowedFileTypes = ["application/pdf", "image/jpeg", "image/png"];
 
-const equipmentSeed: Equipment[] = [
-  { id: 101, name: "Notebook Dell Inspiron", type: "Notebook", storeId: 1, serial: "DL-8X2K-410", purchaseDate: "2026-01-18", value: 4299, warrantyStart: "2026-01-18", warrantyEnd: "2027-01-18", notes: "Equipamento da administração", active: true, attachments: [{ id: "demo-1", name: "nota-fiscal-dell.pdf", type: "application/pdf", size: 248000, kind: "Nota fiscal" }] },
-  { id: 102, name: "Monitor LG 24\"", type: "Monitor", storeId: 2, serial: "LG24-99281", purchaseDate: "2025-11-03", value: 899, warrantyStart: "2025-11-03", warrantyEnd: "2026-11-03", notes: "", active: true, attachments: [] },
-  { id: 103, name: "Roteador TP-Link AX", type: "Roteador", storeId: 3, serial: "TPL-AX-7740", purchaseDate: "2025-07-10", value: 629, warrantyStart: "2025-07-10", warrantyEnd: "2026-07-10", notes: "Substituído por modelo mais novo", active: false, attachments: [] },
-  { id: 104, name: "Impressora Epson L3250", type: "Impressora", storeId: 4, serial: "EPS-L32-4401", purchaseDate: "2026-03-02", value: 1190, warrantyStart: "2026-03-02", warrantyEnd: "2027-03-02", notes: "Possui garantia estendida", active: true, attachments: [] },
-];
+function addOneYear(date: string) {
+  if (!date) return "";
+  const [year, month, day] = date.split("-").map(Number);
+  const next = new Date(Date.UTC(year + 1, month - 1, day));
+  return next.toISOString().slice(0, 10);
+}
 
-const initialTypes = ["Computador", "Monitor", "Notebook", "TV", "Cabo", "Mouse", "Teclado", "Impressora", "Roteador"];
-const navItems = ["Visão geral", "Lojas", "Equipamentos", "Garantias", "Inativos"];
+function normalizeReference(value: string) {
+  const cleaned = value.trim().toUpperCase().replace(/^#+/, "").replace(/[^A-Z0-9_-]/g, "").slice(0, 40);
+  return cleaned ? `#${cleaned}` : "";
+}
 
 function money(value: number) {
   return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value || 0);
@@ -121,15 +144,18 @@ export default function Home() {
   const [section, setSection] = useState("Visão geral");
   const [mobileNav, setMobileNav] = useState(false);
   const [stores, setStores] = useState<Store[]>([]);
-  const [types, setTypes] = useState<string[]>([]);
+  const [types, setTypes] = useState<EquipmentType[]>([]);
   const [equipments, setEquipments] = useState<Equipment[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [query, setQuery] = useState("");
   const [stateFilter, setStateFilter] = useState("Todos");
   const [storeFilter, setStoreFilter] = useState("Todas");
   const [periodStart, setPeriodStart] = useState("");
   const [periodEnd, setPeriodEnd] = useState("");
-  const [modal, setModal] = useState<"equipment" | "store" | "type" | "details" | null>(null);
+  const [modal, setModal] = useState<ModalName>(null);
   const [selected, setSelected] = useState<Equipment | null>(null);
+  const [editingEquipment, setEditingEquipment] = useState<Equipment | null>(null);
+  const [editingStore, setEditingStore] = useState<Store | null>(null);
   const [toast, setToast] = useState("");
 
   useEffect(() => {
@@ -170,100 +196,129 @@ export default function Home() {
     return matchesQuery && (stateFilter === "Todos" || store?.state === stateFilter) && (storeFilter === "Todas" || `${item.storeId}` === storeFilter) && (!periodStart || item.purchaseDate >= periodStart) && (!periodEnd || item.purchaseDate <= periodEnd);
   }), [equipments, stores, query, stateFilter, storeFilter, periodStart, periodEnd]);
 
+  function readLegacyArray<T>(key: string): T[] {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(key);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed as T[] : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function hasRealLegacyData() {
+    if (typeof window === "undefined" || localStorage.getItem("ce_cloud_migrated") === "yes") return false;
+    return ["ce_stores", "ce_equipments", "ce_types"].some((key) => {
+      const value = localStorage.getItem(key);
+      if (!value) return false;
+      try { return Array.isArray(JSON.parse(value)) && JSON.parse(value).length > 0; } catch { return false; }
+    });
+  }
+
   async function migrateLegacyData() {
-    if (!supabase || typeof window === "undefined") return;
+    if (!supabase || !hasRealLegacyData()) return false;
     const { data: userResult, error: userError } = await supabase.auth.getUser();
     const user = userResult.user;
     if (userError || !user || user.email?.toLowerCase() !== authorizedEmail) throw new Error("Sessão inválida.");
 
-    const readLegacy = <T,>(key: string, fallback: T): T => {
-      try {
-        const value = localStorage.getItem(key);
-        return value ? JSON.parse(value) as T : fallback;
-      } catch {
-        return fallback;
-      }
-    };
-    const legacyStores = readLegacy<Store[]>("ce_stores", storesSeed);
-    const legacyEquipments = readLegacy<Equipment[]>("ce_equipments", equipmentSeed);
-    const legacyTypes = readLegacy<string[]>("ce_types", initialTypes);
-    const allTypeNames = [...new Set([...initialTypes, ...legacyTypes, ...legacyEquipments.map((item) => item.type)])];
+    const legacyStores = readLegacyArray<Store>("ce_stores");
+    const legacyEquipments = readLegacyArray<Equipment>("ce_equipments");
+    const legacyTypes = readLegacyArray<string>("ce_types");
+    const allTypeNames = [...new Set([...legacyTypes, ...legacyEquipments.map((item) => item.type)].map((name) => `${name}`.trim()).filter(Boolean))];
 
-    const { data: insertedTypes, error: typeError } = await supabase
-      .from("equipment_types")
-      .insert(allTypeNames.map((name) => ({ owner_id: user.id, name })))
-      .select("id, name");
-    if (typeError) throw typeError;
-    const typeIds = new Map((insertedTypes || []).map((item) => [item.name, item.id]));
+    if (allTypeNames.length) {
+      const { error } = await supabase.from("equipment_types").upsert(
+        allTypeNames.map((name) => ({ owner_id: user.id, name })),
+        { onConflict: "owner_id,name", ignoreDuplicates: true },
+      );
+      if (error) throw error;
+      localStorage.setItem("ce_cloud_migration_stage", "types");
+    }
+    const { data: cloudTypes, error: cloudTypesError } = await supabase.from("equipment_types").select("id, name");
+    if (cloudTypesError) throw cloudTypesError;
+    const typeIds = new Map((cloudTypes || []).map((item) => [item.name, item.id]));
 
-    const { data: insertedStores, error: storeError } = await supabase
-      .from("stores")
-      .insert(legacyStores.map((store) => ({
+    const { data: currentStores, error: currentStoresError } = await supabase.from("stores").select("id, name, state, city");
+    if (currentStoresError) throw currentStoresError;
+    const storeKey = (store: Pick<Store, "name" | "state" | "city">) => `${store.name.trim().toLowerCase()}|${store.state.toUpperCase()}|${(store.city || "").trim().toLowerCase()}`;
+    const knownStoreKeys = new Set((currentStores || []).map(storeKey));
+    const missingStores = legacyStores.filter((store) => !knownStoreKeys.has(storeKey(store)));
+    if (missingStores.length) {
+      const { error } = await supabase.from("stores").insert(missingStores.map((store) => ({
         owner_id: user.id,
-        name: store.name,
+        name: store.name.trim(),
         state: store.state.toUpperCase(),
         city: store.city || "",
         address: store.address || "",
-      })))
-      .select("id, name");
-    if (storeError) throw storeError;
-    const storeIds = new Map(legacyStores.map((store, index) => [store.id, insertedStores?.[index]?.id]));
+      })));
+      if (error) throw error;
+    }
+    localStorage.setItem("ce_cloud_migration_stage", "stores");
+    const { data: cloudStores, error: cloudStoresError } = await supabase.from("stores").select("id, name, state, city");
+    if (cloudStoresError) throw cloudStoresError;
+    const cloudStoreIds = new Map((cloudStores || []).map((store) => [storeKey(store), store.id]));
+    const legacyStoreIds = new Map(legacyStores.map((store) => [store.id, cloudStoreIds.get(storeKey(store))]));
 
+    const { data: existingEquipments, error: equipmentLookupError } = await supabase.from("equipments").select("id, serial_number");
+    if (equipmentLookupError) throw equipmentLookupError;
+    const equipmentBySerial = new Map((existingEquipments || []).map((item) => [item.serial_number.trim().toLowerCase(), item.id]));
     for (const item of legacyEquipments) {
       const equipmentTypeId = typeIds.get(item.type);
-      const storeId = storeIds.get(item.storeId);
-      if (!equipmentTypeId || !storeId) continue;
-      const { data: created, error: equipmentError } = await supabase.from("equipments").insert({
-        owner_id: user.id,
-        name: item.name,
-        equipment_type_id: equipmentTypeId,
-        store_id: storeId,
-        serial_number: item.serial,
-        purchase_date: item.purchaseDate,
-        purchase_value: item.value || 0,
-        warranty_start: item.warrantyStart || null,
-        warranty_end: item.warrantyEnd || null,
-        extended_warranty_end: item.extendedWarrantyEnd || null,
-        warranty_closed: Boolean(item.warrantyClosed),
-        notes: item.notes || "",
-        active: item.active,
-      }).select("id").single();
-      if (equipmentError || !created) throw equipmentError || new Error("Falha ao migrar equipamento.");
-
+      const storeId = legacyStoreIds.get(item.storeId);
+      if (!equipmentTypeId || !storeId || !item.serial?.trim()) continue;
+      const serialKey = item.serial.trim().toLowerCase();
+      let equipmentId = equipmentBySerial.get(serialKey);
+      if (!equipmentId) {
+        const { data: created, error } = await supabase.from("equipments").insert({
+          owner_id: user.id,
+          name: item.name,
+          equipment_type_id: equipmentTypeId,
+          store_id: storeId,
+          serial_number: item.serial.trim(),
+          purchase_date: item.purchaseDate,
+          purchase_value: item.value || 0,
+          warranty_start: item.warrantyStart || null,
+          warranty_end: item.warrantyEnd || null,
+          extended_warranty_end: item.extendedWarrantyEnd || null,
+          warranty_closed: Boolean(item.warrantyClosed),
+          notes: item.notes || "",
+          active: item.active,
+        }).select("id").single();
+        if (error || !created) throw error || new Error("Falha ao migrar equipamento.");
+        equipmentId = created.id;
+        equipmentBySerial.set(serialKey, equipmentId);
+      }
+      const { data: linkedFiles } = await supabase.from("attachments").select("file_name, size_bytes").eq("equipment_id", equipmentId);
       for (const file of item.attachments || []) {
+        if ((linkedFiles || []).some((linked) => linked.file_name === file.name && Number(linked.size_bytes) === file.size)) continue;
         let blob: Blob | undefined;
         try { blob = await readLegacyBlob(file.id); } catch { blob = undefined; }
-        if (!blob || !["application/pdf", "image/jpeg", "image/png"].includes(file.type)) continue;
-        const path = `${user.id}/${created.id}/${crypto.randomUUID()}-${safeFileName(file.name)}`;
+        if (!blob || !allowedFileTypes.includes(file.type)) continue;
+        const path = `${user.id}/${equipmentId}/${crypto.randomUUID()}-${safeFileName(file.name)}`;
         const { error: uploadError } = await supabase.storage.from(documentsBucket).upload(path, blob, { contentType: file.type, upsert: false });
         if (uploadError) continue;
-        await supabase.from("attachments").insert({
-          owner_id: user.id,
-          equipment_id: created.id,
-          file_name: file.name,
-          mime_type: file.type,
-          size_bytes: file.size,
-          kind: file.kind,
-          storage_path: path,
-        });
+        await supabase.from("attachments").insert({ owner_id: user.id, equipment_id: equipmentId, file_name: file.name, mime_type: file.type, size_bytes: file.size, kind: file.kind, storage_path: path });
       }
     }
+    localStorage.setItem("ce_cloud_migration_stage", "done");
     localStorage.setItem("ce_cloud_migrated", "yes");
+    return true;
   }
 
   async function loadCloudData(allowMigration = true) {
     if (!supabase) return;
     setLoadingData(true);
     try {
-      const [storeResult, typeResult, equipmentResult] = await Promise.all([
+      const [storeResult, typeResult, equipmentResult, auditResult] = await Promise.all([
         supabase.from("stores").select("id, name, state, city, address").order("name"),
         supabase.from("equipment_types").select("id, name").order("name"),
-        supabase.from("equipments").select("id, name, store_id, serial_number, purchase_date, purchase_value, warranty_start, warranty_end, extended_warranty_end, warranty_closed, notes, active, created_at, equipment_types(name), attachments(id, file_name, mime_type, size_bytes, kind, storage_path)").order("created_at", { ascending: false }),
+        supabase.from("equipments").select("id, name, equipment_type_id, store_id, serial_number, purchase_date, purchase_value, warranty_start, warranty_end, extended_warranty_end, warranty_closed, notes, active, created_at, equipment_types(name), attachments(id, file_name, mime_type, size_bytes, kind, storage_path, reference_code)").order("created_at", { ascending: false }),
+        supabase.from("audit_logs").select("id, action, entity_type, entity_id, entity_label, actor_email, old_values, new_values, created_at").order("created_at", { ascending: false }).limit(1000),
       ]);
-      const firstError = storeResult.error || typeResult.error || equipmentResult.error;
+      const firstError = storeResult.error || typeResult.error || equipmentResult.error || auditResult.error;
       if (firstError) throw firstError;
-      if (allowMigration && !storeResult.data?.length && !equipmentResult.data?.length) {
-        await migrateLegacyData();
+      if (allowMigration && hasRealLegacyData() && await migrateLegacyData()) {
         await loadCloudData(false);
         return;
       }
@@ -274,12 +329,13 @@ export default function Home() {
         city: store.city,
         address: store.address,
       })));
-      setTypes((typeResult.data || []).map((type) => type.name));
+      setTypes((typeResult.data || []).map((type) => ({ id: type.id, name: type.name })));
       setEquipments((equipmentResult.data || []).map((item) => {
         const relation = Array.isArray(item.equipment_types) ? item.equipment_types[0] : item.equipment_types;
         return {
           id: item.id,
           name: item.name,
+          typeId: item.equipment_type_id,
           type: relation?.name || "Sem tipo",
           storeId: item.store_id,
           serial: item.serial_number,
@@ -298,9 +354,21 @@ export default function Home() {
             size: Number(file.size_bytes),
             kind: file.kind as Attachment["kind"],
             path: file.storage_path,
+            referenceCode: file.reference_code || "",
           })),
         };
       }));
+      setAuditLogs((auditResult.data || []).map((entry) => ({
+        id: entry.id,
+        action: entry.action as AuditLog["action"],
+        entityType: entry.entity_type,
+        entityId: entry.entity_id,
+        entityLabel: entry.entity_label || "",
+        actorEmail: entry.actor_email || "sistema",
+        oldValues: entry.old_values,
+        newValues: entry.new_values,
+        createdAt: entry.created_at,
+      })));
     } catch (error) {
       console.error(error);
       setToast("Não foi possível carregar os dados do servidor.");
@@ -340,6 +408,7 @@ export default function Home() {
     setStores([]);
     setTypes([]);
     setEquipments([]);
+    setAuditLogs([]);
   }
 
   async function addStore(e: FormEvent<HTMLFormElement>) {
@@ -361,86 +430,222 @@ export default function Home() {
     setToast("Loja cadastrada com sucesso.");
   }
 
-  async function addType(e: FormEvent<HTMLFormElement>) {
+  function requestEditStore(store: Store) {
+    if (!window.confirm(`Autoriza a edição da loja “${store.name}”? A alteração ficará registrada na auditoria.`)) return;
+    setEditingStore(store);
+    setModal("store");
+  }
+
+  async function updateStore(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!supabase || !editingStore) return;
+    const data = new FormData(e.currentTarget);
+    const changes = {
+      name: String(data.get("name")).trim(),
+      state: String(data.get("state")).trim().toUpperCase(),
+      city: String(data.get("city") || "").trim(),
+      address: String(data.get("address") || "").trim(),
+    };
+    const { data: updated, error } = await supabase.from("stores").update(changes).eq("id", editingStore.id).select("id, name, state, city, address").single();
+    if (error || !updated) {
+      setToast("Não foi possível editar a loja.");
+      return;
+    }
+    setStores((current) => current.map((store) => store.id === updated.id ? updated : store).sort((a, b) => a.name.localeCompare(b.name)));
+    setEditingStore(null);
+    setModal(null);
+    await loadCloudData(false);
+    setToast("Loja atualizada e registrada na auditoria.");
+  }
+
+  async function deleteStore(store: Store) {
     if (!supabase) return;
-    const value = `${new FormData(e.currentTarget).get("name")}`.trim();
-    if (!value || types.includes(value)) {
-      setModal("equipment");
+    const linked = equipments.filter((item) => item.storeId === store.id).length;
+    if (linked) {
+      setToast(`A loja possui ${linked} equipamento(s). Migre os equipamentos antes de excluir.`);
+      return;
+    }
+    if (!window.confirm(`Autoriza excluir a loja “${store.name}”? Esta ação não pode ser desfeita e ficará registrada na auditoria.`)) return;
+    const { error } = await supabase.from("stores").delete().eq("id", store.id);
+    if (error) {
+      setToast("Não foi possível excluir a loja.");
+      return;
+    }
+    setStores((current) => current.filter((item) => item.id !== store.id));
+    await loadCloudData(false);
+    setToast("Loja excluída e registrada na auditoria.");
+  }
+
+  async function addType(value: string) {
+    if (!supabase) return;
+    const normalized = value.trim();
+    if (!normalized || types.some((type) => type.name.toLowerCase() === normalized.toLowerCase())) {
       setToast("Esse tipo já está cadastrado.");
       return;
     }
-    const { error } = await supabase.from("equipment_types").insert({ name: value });
-    if (error) {
+    const { data: created, error } = await supabase.from("equipment_types").insert({ name: normalized }).select("id, name").single();
+    if (error || !created) {
       setToast("Não foi possível cadastrar o tipo.");
       return;
     }
-    setTypes((current) => [...current, value].sort());
-    setModal("equipment");
+    setTypes((current) => [...current, created].sort((a, b) => a.name.localeCompare(b.name)));
+    await loadCloudData(false);
     setToast("Tipo de equipamento cadastrado.");
   }
 
-  async function addEquipment(e: FormEvent<HTMLFormElement>) {
+  async function editType(type: EquipmentType, value: string) {
+    if (!supabase) return;
+    const normalized = value.trim();
+    if (!normalized) return;
+    if (!window.confirm(`Autoriza alterar o tipo “${type.name}” para “${normalized}”? Os equipamentos vinculados serão atualizados.`)) return;
+    const { error } = await supabase.from("equipment_types").update({ name: normalized }).eq("id", type.id);
+    if (error) {
+      setToast(error.code === "23505" ? "Já existe um tipo com esse nome." : "Não foi possível editar o tipo.");
+      return;
+    }
+    await loadCloudData(false);
+    setToast("Tipo atualizado e registrado na auditoria.");
+  }
+
+  async function deleteType(type: EquipmentType) {
+    if (!supabase) return;
+    const linked = equipments.filter((item) => item.typeId === type.id).length;
+    if (linked) {
+      setToast(`Este tipo está vinculado a ${linked} equipamento(s) e não pode ser excluído.`);
+      return;
+    }
+    if (!window.confirm(`Autoriza excluir o tipo “${type.name}”? A ação ficará registrada na auditoria.`)) return;
+    const { error } = await supabase.from("equipment_types").delete().eq("id", type.id);
+    if (error) {
+      setToast("Não foi possível excluir o tipo.");
+      return;
+    }
+    await loadCloudData(false);
+    setToast("Tipo excluído e registrado na auditoria.");
+  }
+
+  async function attachDocuments(equipmentId: number, files: File[], referenceCode: string, userId: string) {
+    let failures = 0;
+    let reused = 0;
+    if (referenceCode) {
+      const { data: currentFiles } = await supabase!.from("attachments").select("storage_path").eq("equipment_id", equipmentId);
+      const currentPaths = new Set((currentFiles || []).map((file) => file.storage_path));
+      const { data: sharedFiles, error: sharedError } = await supabase!.from("attachments")
+        .select("file_name, mime_type, size_bytes, kind, storage_path")
+        .eq("reference_code", referenceCode)
+        .neq("equipment_id", equipmentId);
+      if (sharedError) failures += 1;
+      const uniqueShared = [...new Map((sharedFiles || []).map((file) => [file.storage_path, file])).values()]
+        .filter((file) => !currentPaths.has(file.storage_path));
+      if (uniqueShared.length) {
+        const { error } = await supabase!.from("attachments").insert(uniqueShared.map((file) => ({
+          owner_id: userId,
+          equipment_id: equipmentId,
+          file_name: file.file_name,
+          mime_type: file.mime_type,
+          size_bytes: file.size_bytes,
+          kind: file.kind,
+          storage_path: file.storage_path,
+          reference_code: referenceCode,
+        })));
+        if (error) failures += 1;
+        else reused += uniqueShared.length;
+      }
+    }
+    for (const file of files) {
+      const path = `${userId}/${equipmentId}/${crypto.randomUUID()}-${safeFileName(file.name)}`;
+      const { error: uploadError } = await supabase!.storage.from(documentsBucket).upload(path, file, { contentType: file.type, upsert: false });
+      if (uploadError) {
+        failures += 1;
+        continue;
+      }
+      const { error } = await supabase!.from("attachments").insert({
+        owner_id: userId,
+        equipment_id: equipmentId,
+        file_name: file.name,
+        mime_type: file.type,
+        size_bytes: file.size,
+        kind: file.name.toLowerCase().includes("garantia") ? "Garantia estendida" : "Nota fiscal",
+        storage_path: path,
+        reference_code: referenceCode || null,
+      });
+      if (error) failures += 1;
+    }
+    return { failures, reused };
+  }
+
+  async function saveEquipment(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!supabase) return;
     const data = new FormData(e.currentTarget);
     const input = e.currentTarget.elements.namedItem("files") as HTMLInputElement;
     const fileList = Array.from(input.files || []);
-    const allowedTypes = ["application/pdf", "image/jpeg", "image/png"];
-    if (fileList.some((file) => !allowedTypes.includes(file.type))) {
+    if (fileList.some((file) => !allowedFileTypes.includes(file.type))) {
       setToast("Envie somente arquivos PDF, JPG ou PNG.");
       return;
     }
     const { data: userResult } = await supabase.auth.getUser();
     const user = userResult.user;
-    const { data: selectedType, error: typeError } = await supabase.from("equipment_types").select("id").eq("name", String(data.get("type"))).single();
-    if (!user || typeError || !selectedType) {
+    const equipmentTypeId = Number(data.get("type"));
+    const storeId = Number(data.get("store"));
+    if (!user || !types.some((type) => type.id === equipmentTypeId) || !stores.some((store) => store.id === storeId)) {
       setToast("Não foi possível validar o cadastro.");
       return;
     }
-    const { data: created, error: equipmentError } = await supabase.from("equipments").insert({
+    if (editingEquipment && storeId !== editingEquipment.storeId) {
+      const from = stores.find((store) => store.id === editingEquipment.storeId)?.name;
+      const to = stores.find((store) => store.id === storeId)?.name;
+      if (!window.confirm(`Confirmar migração de loja?\n\nO equipamento sairá de “${from}” e passará para “${to}”. A alteração ficará registrada na auditoria.`)) return;
+    }
+    const wasEditing = Boolean(editingEquipment);
+    const payload = {
       name: String(data.get("name")).trim(),
-      equipment_type_id: selectedType.id,
-      store_id: Number(data.get("store")),
+      equipment_type_id: equipmentTypeId,
+      store_id: storeId,
       serial_number: String(data.get("serial")).trim(),
       purchase_date: String(data.get("purchaseDate")),
       purchase_value: Number(data.get("value") || 0),
       warranty_start: String(data.get("warrantyStart") || "") || null,
       warranty_end: String(data.get("warrantyEnd") || "") || null,
       extended_warranty_end: String(data.get("extendedWarrantyEnd") || "") || null,
-      warranty_closed: false,
+      warranty_closed: editingEquipment?.warrantyClosed || false,
       notes: String(data.get("notes") || "").trim(),
-      active: true,
-    }).select("id").single();
-    if (equipmentError || !created) {
+      ...(editingEquipment ? {} : { active: true }),
+    };
+    const saveResult = editingEquipment
+      ? await supabase.from("equipments").update(payload).eq("id", editingEquipment.id).select("id").single()
+      : await supabase.from("equipments").insert(payload).select("id").single();
+    const savedId = saveResult.data?.id;
+    if (saveResult.error || !savedId) {
+      const equipmentError = saveResult.error;
       setToast(equipmentError?.code === "23505" ? "Já existe um equipamento com esse número de série." : "Não foi possível cadastrar o equipamento.");
       return;
     }
-    let uploadFailures = 0;
-    for (const file of fileList) {
-      const path = `${user.id}/${created.id}/${crypto.randomUUID()}-${safeFileName(file.name)}`;
-      const { error: uploadError } = await supabase.storage.from(documentsBucket).upload(path, file, { contentType: file.type, upsert: false });
-      if (uploadError) {
-        uploadFailures += 1;
-        continue;
-      }
-      const { error: attachmentError } = await supabase.from("attachments").insert({
-        equipment_id: created.id,
-        file_name: file.name,
-        mime_type: file.type,
-        size_bytes: file.size,
-        kind: file.name.toLowerCase().includes("garantia") ? "Garantia estendida" : "Nota fiscal",
-        storage_path: path,
-      });
-      if (attachmentError) uploadFailures += 1;
+    const referenceCode = normalizeReference(String(data.get("referenceCode") || ""));
+    if (editingEquipment) {
+      await supabase.from("attachments").update({ reference_code: referenceCode || null }).eq("equipment_id", savedId).eq("kind", "Nota fiscal");
     }
+    const { failures, reused } = await attachDocuments(savedId, fileList, referenceCode, user.id);
     await loadCloudData(false);
+    setEditingEquipment(null);
     setModal(null);
-    setToast(uploadFailures ? "Equipamento salvo, mas alguns documentos não foram enviados." : "Equipamento cadastrado com sucesso.");
+    if (failures) setToast("Equipamento salvo, mas alguns documentos não puderam ser vinculados.");
+    else if (reused) setToast(`Equipamento salvo e ${reused} documento(s) compartilhado(s) pelo código ${referenceCode}.`);
+    else setToast(wasEditing ? "Equipamento atualizado e registrado na auditoria." : "Equipamento cadastrado com sucesso.");
+  }
+
+  function requestEditEquipment(item: Equipment) {
+    if (!window.confirm(`Autoriza editar todas as informações de “${item.name}”? As alterações ficarão registradas na auditoria.`)) return;
+    setEditingEquipment(item);
+    setModal("equipment");
   }
 
   async function toggleActive(item: Equipment) {
     if (!supabase) return;
+    const message = item.active
+      ? `Confirmar envio de “${item.name}” para inativos? O histórico e os documentos serão preservados.`
+      : `Confirmar reativação de “${item.name}”?`;
+    if (!window.confirm(message)) return;
     const { error } = await supabase.from("equipments").update({ active: !item.active }).eq("id", item.id);
     if (error) {
       setToast("Não foi possível alterar o equipamento.");
@@ -453,12 +658,14 @@ export default function Home() {
 
   async function changeWarranty(item: Equipment, action: "start" | "end") {
     if (!supabase) return;
+    if (!window.confirm(action === "start" ? `Iniciar a garantia de “${item.name}” hoje?` : `Encerrar a garantia de “${item.name}” hoje?`)) return;
     const today = new Date().toISOString().slice(0, 10);
+    const automaticEnd = addOneYear(today);
     const updated = action === "start"
-      ? { ...item, warrantyStart: today, warrantyClosed: false }
+      ? { ...item, warrantyStart: today, warrantyEnd: automaticEnd, warrantyClosed: false }
       : { ...item, warrantyEnd: today, extendedWarrantyEnd: "", warrantyClosed: true };
     const { error } = await supabase.from("equipments").update(action === "start"
-      ? { warranty_start: today, warranty_closed: false }
+      ? { warranty_start: today, warranty_end: automaticEnd, warranty_closed: false }
       : { warranty_end: today, extended_warranty_end: null, warranty_closed: true }
     ).eq("id", item.id);
     if (error) {
@@ -506,27 +713,28 @@ export default function Home() {
     <main className="app-shell">
       <aside className={mobileNav ? "sidebar open" : "sidebar"}>
         <div className="sidebar-brand"><div className="brand-mark small">CE</div><div><b>Controle</b><span>Equipamentos</span></div></div>
-        <nav>{navItems.map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => { setSection(item); setMobileNav(false); }}><span className="nav-icon">{item === "Visão geral" ? "⌂" : item === "Lojas" ? "▦" : item === "Equipamentos" ? "▣" : item === "Garantias" ? "◇" : "↘"}</span>{item}{item === "Inativos" && <small>{equipments.filter((e) => !e.active).length}</small>}</button>)}</nav>
+        <nav>{navItems.map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => { setSection(item); setMobileNav(false); }}><span className="nav-icon">{item === "Visão geral" ? "⌂" : item === "Lojas" ? "▦" : item === "Equipamentos" ? "▣" : item === "Garantias" ? "◇" : item === "Auditoria" ? "☷" : "↘"}</span>{item}{item === "Inativos" && <small>{equipments.filter((e) => !e.active).length}</small>}</button>)}</nav>
         <div className="sidebar-user"><div className="avatar">AD</div><div><b>Administrador</b><span>tipaparazzirn</span></div><button title="Sair" onClick={logout}>↪</button></div>
       </aside>
       <section className="workspace">
         <header className="topbar">
           <button className="menu-button" onClick={() => setMobileNav(!mobileNav)}>☰</button>
           <div><p className="breadcrumb">Sistema / {section}</p><h1>{section}</h1></div>
-          <div className="top-actions"><button className="secondary" onClick={() => setModal("store")}>+ Nova loja</button><button className="primary" onClick={() => setModal("equipment")}>+ Novo equipamento</button></div>
+          <div className="top-actions"><button className="secondary" onClick={() => { setEditingStore(null); setModal("store"); }}>+ Nova loja</button><button className="primary" onClick={() => { setEditingEquipment(null); setModal("equipment"); }}>+ Novo equipamento</button></div>
         </header>
 
         {section === "Visão geral" && <Dashboard active={active} stores={stores} equipments={equipments} setSection={setSection} setSelected={setSelected} setModal={setModal} />}
-        {section === "Lojas" && <StoresView stores={stores} equipments={equipments} onOpen={(id) => { setStoreFilter(`${id}`); setSection("Equipamentos"); }} onNew={() => setModal("store")} />}
+        {section === "Lojas" && <StoresView stores={stores} equipments={equipments} onOpen={(id) => { setStoreFilter(`${id}`); setSection("Equipamentos"); }} onNew={() => { setEditingStore(null); setModal("store"); }} onEdit={requestEditStore} onDelete={deleteStore} />}
         {(section === "Equipamentos" || section === "Inativos") && <EquipmentView section={section} rows={contentRows} stores={stores} states={states} query={query} setQuery={setQuery} stateFilter={stateFilter} setStateFilter={setStateFilter} storeFilter={storeFilter} setStoreFilter={setStoreFilter} periodStart={periodStart} setPeriodStart={setPeriodStart} periodEnd={periodEnd} setPeriodEnd={setPeriodEnd} onOpen={(item) => { setSelected(item); setModal("details"); }} />}
         {section === "Garantias" && <WarrantyView equipments={active} stores={stores} onOpen={(item) => { setSelected(item); setModal("details"); }} />}
+        {section === "Auditoria" && <AuditView logs={auditLogs} stores={stores} types={types} />}
       </section>
 
       {modal && <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setModal(null); }}>
-        {modal === "equipment" && <EquipmentForm stores={stores} types={types} onSubmit={addEquipment} onClose={() => setModal(null)} onNewType={() => setModal("type")} />}
-        {modal === "store" && <StoreForm states={states} onSubmit={addStore} onClose={() => setModal(null)} />}
-        {modal === "type" && <TypeForm onSubmit={addType} onClose={() => setModal("equipment")} />}
-        {modal === "details" && selected && <Details item={selected} store={stores.find((s) => s.id === selected.storeId)} onClose={() => setModal(null)} onToggle={() => toggleActive(selected)} onWarrantyAction={(action) => changeWarranty(selected, action)} />}
+        {modal === "equipment" && <EquipmentForm key={editingEquipment?.id || "new"} item={editingEquipment || undefined} stores={stores} types={types} onSubmit={saveEquipment} onClose={() => { setEditingEquipment(null); setModal(null); }} onManageTypes={() => setModal("types")} />}
+        {modal === "store" && <StoreForm key={editingStore?.id || "new"} store={editingStore || undefined} states={states} onSubmit={editingStore ? updateStore : addStore} onClose={() => { setEditingStore(null); setModal(null); }} />}
+        {modal === "types" && <TypeManager types={types} onAdd={addType} onEdit={editType} onDelete={deleteType} onClose={() => setModal("equipment")} />}
+        {modal === "details" && selected && <Details item={selected} store={stores.find((s) => s.id === selected.storeId)} onClose={() => setModal(null)} onEdit={() => requestEditEquipment(selected)} onToggle={() => toggleActive(selected)} onWarrantyAction={(action) => changeWarranty(selected, action)} />}
       </div>}
       {toast && <div className="toast">✓ {toast}</div>}
     </main>
@@ -560,8 +768,23 @@ function Metric({ icon, tone, label, value, detail }: { icon: string; tone: stri
   return <article className="metric"><span className={`metric-icon ${tone}`}>{icon}</span><div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div></article>;
 }
 
-function StoresView({ stores, equipments, onOpen, onNew }: { stores: Store[]; equipments: Equipment[]; onOpen: (id: number) => void; onNew: () => void }) {
-  return <div className="content"><div className="section-title"><div><h2>Lojas cadastradas</h2><p>Selecione uma loja para visualizar seus equipamentos.</p></div><button className="primary" onClick={onNew}>+ Cadastrar loja</button></div><div className="store-grid">{stores.map((store) => { const items = equipments.filter((e) => e.storeId === store.id && e.active); return <article className="store-card" key={store.id}><div className="store-card-top"><span>▦</span><small>{store.state}</small></div><h3>{store.name}</h3><p>{store.city || "Cidade não informada"} · {store.state}</p><div className="store-stats"><div><b>{items.length}</b><span>Ativos</span></div><div><b>{items.filter((e) => equipmentWarrantyState(e).className === "warning").length}</b><span>Em atenção</span></div></div><button onClick={() => onOpen(store.id)}>Ver equipamentos <span>→</span></button></article>; })}</div></div>;
+function StoresView({ stores, equipments, onOpen, onNew, onEdit, onDelete }: { stores: Store[]; equipments: Equipment[]; onOpen: (id: number) => void; onNew: () => void; onEdit: (store: Store) => void; onDelete: (store: Store) => void }) {
+  const [search, setSearch] = useState("");
+  const visibleStores = stores.filter((store) => `${store.name} ${store.city} ${store.state} ${store.address || ""}`.toLowerCase().includes(search.toLowerCase()));
+  return <div className="content">
+    <div className="section-title"><div><h2>Lojas cadastradas</h2><p>Pesquise, edite ou consulte os equipamentos de cada unidade.</p></div><button className="primary" onClick={onNew}>+ Cadastrar loja</button></div>
+    <label className="search store-search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar loja por nome, cidade ou estado..." /></label>
+    {visibleStores.length ? <div className="store-grid">{visibleStores.map((store) => {
+      const items = equipments.filter((e) => e.storeId === store.id && e.active);
+      return <article className="store-card" key={store.id}>
+        <div className="store-card-top"><span>▦</span><small>{store.state}</small></div>
+        <h3>{store.name}</h3><p>{store.city || "Cidade não informada"} · {store.state}</p>
+        <div className="store-stats"><div><b>{items.length}</b><span>Ativos</span></div><div><b>{items.filter((e) => equipmentWarrantyState(e).className === "warning").length}</b><span>Em atenção</span></div></div>
+        <button onClick={() => onOpen(store.id)}>Ver equipamentos <span>→</span></button>
+        <div className="store-actions"><button onClick={() => onEdit(store)}>Editar</button><button className="danger-link" onClick={() => onDelete(store)}>Excluir</button></div>
+      </article>;
+    })}</div> : <div className="empty-state panel"><span>⌕</span><h3>Nenhuma loja encontrada.</h3><p>Altere o termo da busca.</p></div>}
+  </div>;
 }
 
 type EquipmentViewProps = {
@@ -611,21 +834,139 @@ function WarrantyView({ equipments, stores, onOpen }: { equipments: Equipment[];
   return <div className="content"><div className="section-title"><div><h2>Controle de garantias</h2><p>Acompanhe prazos e documentos relacionados.</p></div></div><div className="warranty-search"><label className="search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar equipamento, loja ou número de série..." /></label></div>{groups.map((group) => <section className="panel warranty-group" key={group.title}><div className="group-title"><span className={`status-dot ${group.tone}`}></span><h3>{group.title}</h3>{group.tone === "success" && <label className="expiry-filter"><span>Vencimento</span><select value={expiryFilter} onChange={(e) => setExpiryFilter(e.target.value)}><option value="all">Todos os vencimentos</option><option value="six-months">Até 6 meses</option><option value="one-year">De 6 a 12 meses</option><option value="over-year">Mais de 1 ano</option><option value="no-date">Sem data definida</option></select></label>}<b>{group.rows.length}</b></div><EquipmentTable rows={group.rows} stores={stores} onOpen={onOpen} empty={`Nenhum equipamento em “${group.title}”.`} /></section>)}</div>;
 }
 
-function EquipmentForm({ stores, types, onSubmit, onClose, onNewType }: { stores: Store[]; types: string[]; onSubmit: (e: FormEvent<HTMLFormElement>) => void; onClose: () => void; onNewType: () => void }) {
-  return <form className="modal large" onSubmit={onSubmit}><ModalHead title="Novo equipamento" subtitle="Cadastre os dados, a garantia e os documentos." onClose={onClose} /><div className="form-grid"><label className="span-2">Nome do equipamento<input name="name" placeholder="Ex.: Notebook Dell Inspiron" required /></label><label>Tipo<select name="type" required>{types.map((t) => <option key={t}>{t}</option>)}</select><button type="button" className="inline-link" onClick={onNewType}>+ Criar novo tipo</button></label><label>Loja<select name="store" required>{stores.map((s) => <option value={s.id} key={s.id}>{s.name} — {s.state}</option>)}</select><small className="field-help">A loja não poderá ser alterada após salvar.</small></label><label>Número de série<input name="serial" placeholder="Digite o número de série" required /></label><label>Data da compra<input name="purchaseDate" type="date" required /></label><label>Valor (opcional)<input name="value" type="number" min="0" step="0.01" placeholder="0,00" /></label><label>Início da garantia<input name="warrantyStart" type="date" /></label><label>Término da garantia<input name="warrantyEnd" type="date" /></label><label>Garantia estendida até (opcional)<input name="extendedWarrantyEnd" type="date" /><small className="field-help">Esta data passa a ser o vencimento efetivo da garantia.</small></label><label className="span-2">Notas fiscais e documentos<input className="file-input" name="files" type="file" accept=".pdf,.jpg,.jpeg,.png" multiple /><small className="field-help">PDF, JPG ou PNG. Você pode selecionar a nota e a garantia estendida.</small></label><label className="span-2">Observações<textarea name="notes" placeholder="Informações adicionais sobre o equipamento..." /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">Salvar equipamento</button></div></form>;
+function AuditView({ logs, stores, types }: { logs: AuditLog[]; stores: Store[]; types: EquipmentType[] }) {
+  const [search, setSearch] = useState("");
+  const [action, setAction] = useState("ALL");
+  const rows = logs.filter((log) => {
+    const haystack = `${log.entityLabel} ${log.entityType} ${log.actorEmail} ${log.entityId}`.toLowerCase();
+    return haystack.includes(search.toLowerCase()) && (action === "ALL" || log.action === action);
+  });
+  const fieldLabels: Record<string, string> = { name: "Nome", state: "Estado", city: "Cidade", address: "Endereço", store_id: "Loja", equipment_type_id: "Tipo", serial_number: "Número de série", purchase_date: "Data da compra", purchase_value: "Valor", warranty_start: "Início da garantia", warranty_end: "Término da garantia", extended_warranty_end: "Garantia estendida", warranty_closed: "Garantia encerrada", notes: "Observações", active: "Situação", reference_code: "Código da nota", file_name: "Documento" };
+  const displayValue = (key: string, value: unknown) => {
+    if (value === null || value === undefined || value === "") return "—";
+    if (key === "store_id") return stores.find((store) => store.id === Number(value))?.name || `${value}`;
+    if (key === "equipment_type_id") return types.find((type) => type.id === Number(value))?.name || `${value}`;
+    if (["purchase_date", "warranty_start", "warranty_end", "extended_warranty_end"].includes(key)) return formatDate(`${value}`);
+    if (key === "purchase_value") return money(Number(value));
+    if (typeof value === "boolean") return value ? "Sim" : "Não";
+    return `${value}`;
+  };
+  const changesFor = (log: AuditLog) => {
+    const before = log.oldValues || {};
+    const after = log.newValues || {};
+    const ignored = new Set(["id", "owner_id", "created_at", "updated_at", "storage_path"]);
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter((key) => !ignored.has(key) && JSON.stringify(before[key]) !== JSON.stringify(after[key]));
+    return keys.map((key) => ({ label: fieldLabels[key] || key, before: displayValue(key, before[key]), after: displayValue(key, after[key]) }));
+  };
+  const exportCsv = () => {
+    const escape = (value: unknown) => `"${`${value ?? ""}`.replaceAll('"', '""')}"`;
+    const header = ["Data", "Ação", "Entidade", "Registro", "Usuário", "Antes", "Depois"];
+    const lines = rows.map((log) => [new Date(log.createdAt).toLocaleString("pt-BR"), log.action, log.entityType, log.entityLabel, log.actorEmail, JSON.stringify(log.oldValues || {}), JSON.stringify(log.newValues || {})].map(escape).join(";"));
+    const blob = new Blob(["\ufeff", header.map(escape).join(";"), "\n", lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `auditoria-equipamentos-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+  const actionLabel = (value: AuditLog["action"]) => value === "INSERT" ? "Cadastro" : value === "UPDATE" ? "Alteração" : "Exclusão";
+  return <div className="content">
+    <div className="section-title"><div><h2>Log de auditoria</h2><p>Histórico permanente das alterações realizadas no sistema.</p></div><button className="secondary" onClick={exportCsv}>Exportar CSV</button></div>
+    <div className="audit-filters"><label className="search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar registro, usuário ou entidade..." /></label><select value={action} onChange={(e) => setAction(e.target.value)}><option value="ALL">Todas as ações</option><option value="INSERT">Cadastros</option><option value="UPDATE">Alterações</option><option value="DELETE">Exclusões</option></select></div>
+    <div className="panel audit-list">{rows.length ? rows.map((log) => {
+      const changes = changesFor(log);
+      return <details key={log.id}><summary><span className={`audit-action ${log.action.toLowerCase()}`}>{actionLabel(log.action)}</span><div><b>{log.entityLabel || `${log.entityType} #${log.entityId}`}</b><small>{log.entityType} · {log.actorEmail}</small></div><time>{new Date(log.createdAt).toLocaleString("pt-BR")}</time></summary><div className="audit-changes">{changes.length ? changes.map((change) => <div key={change.label}><b>{change.label}</b><span>{change.before}</span><i>→</i><span>{change.after}</span></div>) : <p>Evento registrado sem alteração de campos exibíveis.</p>}</div></details>;
+    }) : <div className="empty-state"><span>☷</span><h3>Nenhum registro encontrado.</h3><p>Altere os filtros ou realize uma nova operação.</p></div>}</div>
+  </div>;
 }
 
-function StoreForm({ states, onSubmit, onClose }: { states: string[]; onSubmit: (e: FormEvent<HTMLFormElement>) => void; onClose: () => void }) {
-  return <form className="modal" onSubmit={onSubmit}><ModalHead title="Cadastrar loja" subtitle="Adicione uma nova unidade ao sistema." onClose={onClose} /><div className="form-grid"><label className="span-2">Nome da loja<input name="name" placeholder="Ex.: Loja Aram" required /></label><label>Estado (sigla)<input name="state" maxLength={2} pattern="[A-Za-z]{2}" placeholder="RN" list="states" required /><datalist id="states">{states.map((s) => <option key={s}>{s}</option>)}</datalist></label><label>Cidade (opcional)<input name="city" placeholder="Natal" /></label><label className="span-2">Endereço (opcional)<input name="address" placeholder="Rua, número e bairro" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">Cadastrar loja</button></div></form>;
+function EquipmentForm({ item, stores, types, onSubmit, onClose, onManageTypes }: { item?: Equipment; stores: Store[]; types: EquipmentType[]; onSubmit: (e: FormEvent<HTMLFormElement>) => void; onClose: () => void; onManageTypes: () => void }) {
+  const [purchaseDate, setPurchaseDate] = useState(item?.purchaseDate || "");
+  const [warrantyStart, setWarrantyStart] = useState(item?.warrantyStart || item?.purchaseDate || "");
+  const suggestedEnd = addOneYear(item?.warrantyStart || item?.purchaseDate || "");
+  const [warrantyEnd, setWarrantyEnd] = useState(item?.warrantyEnd || suggestedEnd);
+  const [manualWarrantyEnd, setManualWarrantyEnd] = useState(Boolean(item?.warrantyEnd && item.warrantyEnd !== suggestedEnd));
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [referenceCode, setReferenceCode] = useState(item?.attachments.find((file) => file.referenceCode)?.referenceCode || "");
+  const changePurchaseDate = (value: string) => {
+    const previousPurchase = purchaseDate;
+    setPurchaseDate(value);
+    if (!warrantyStart || warrantyStart === previousPurchase) {
+      setWarrantyStart(value);
+      if (!manualWarrantyEnd) setWarrantyEnd(addOneYear(value));
+    }
+  };
+  const changeWarrantyStart = (value: string) => {
+    setWarrantyStart(value);
+    if (!manualWarrantyEnd) setWarrantyEnd(addOneYear(value));
+  };
+  return <form className="modal large" onSubmit={onSubmit}>
+    <ModalHead title={item ? "Editar equipamento" : "Novo equipamento"} subtitle={item ? "Altere todos os dados; o histórico será preservado." : "Cadastre os dados, a garantia e os documentos."} onClose={onClose} />
+    <div className="form-grid">
+      <label className="span-2">Nome do equipamento<input name="name" defaultValue={item?.name} placeholder="Ex.: Notebook Dell Inspiron" required /></label>
+      <label>Tipo<select name="type" defaultValue={`${item?.typeId || types[0]?.id || ""}`} required><option value="" disabled>Selecione</option>{types.map((type) => <option value={type.id} key={type.id}>{type.name}</option>)}</select><button type="button" className="inline-link" onClick={onManageTypes}>Gerenciar e editar tipos</button></label>
+      <label>Loja<select name="store" defaultValue={`${item?.storeId || stores[0]?.id || ""}`} required><option value="" disabled>Selecione</option>{stores.map((store) => <option value={store.id} key={store.id}>{store.name} — {store.state}</option>)}</select><small className="field-help">Ao trocar a loja, o sistema solicitará confirmação da migração.</small></label>
+      <label>Número de série<input name="serial" defaultValue={item?.serial} placeholder="Digite o número de série" required /></label>
+      <label>Data da compra<input name="purchaseDate" type="date" value={purchaseDate} onChange={(e) => changePurchaseDate(e.target.value)} required /><small className="field-help">Também preenche automaticamente o início da garantia.</small></label>
+      <label>Valor (opcional)<input name="value" type="number" min="0" step="0.01" defaultValue={item?.value || ""} placeholder="0,00" /></label>
+      <label>Início da garantia<input name="warrantyStart" type="date" value={warrantyStart} onChange={(e) => changeWarrantyStart(e.target.value)} /><small className="field-help">Igual à compra por padrão; pode ser alterado.</small></label>
+      <label>Término da garantia<input name="warrantyEnd" type="date" value={warrantyEnd} onChange={(e) => { setWarrantyEnd(e.target.value); setManualWarrantyEnd(true); }} /><small className="field-help">Calculado automaticamente em 1 ano; edição manual permitida.</small></label>
+      <label>Garantia estendida até (opcional)<input name="extendedWarrantyEnd" type="date" defaultValue={item?.extendedWarrantyEnd} /><small className="field-help">Esta data passa a ser o vencimento efetivo.</small></label>
+      <label className="span-2">Código compartilhado da nota (#)<input name="referenceCode" value={referenceCode} onChange={(e) => setReferenceCode(e.target.value)} onBlur={() => setReferenceCode(normalizeReference(referenceCode))} placeholder="#NF-2026-001" /><small className="field-help">Use o mesmo código em vários equipamentos para vincular a mesma nota fiscal sem reenviar o arquivo.</small></label>
+      <label className="span-2">Notas fiscais e documentos<input className="file-input" name="files" type="file" accept=".pdf,.jpg,.jpeg,.png" multiple onChange={(e) => setSelectedFiles(Array.from(e.target.files || []))} /><small className="field-help">PDF, JPG ou PNG. {item?.attachments.length ? `${item.attachments.length} documento(s) já vinculado(s); novos arquivos serão acrescentados.` : "Selecione a nota e a garantia estendida."}</small></label>
+      {selectedFiles.length > 0 && <LocalFilesPreview files={selectedFiles} />}
+      <label className="span-2">Observações<textarea name="notes" defaultValue={item?.notes} placeholder="Informações adicionais sobre o equipamento..." /></label>
+    </div>
+    <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">{item ? "Salvar alterações" : "Salvar equipamento"}</button></div>
+  </form>;
 }
 
-function TypeForm({ onSubmit, onClose }: { onSubmit: (e: FormEvent<HTMLFormElement>) => void; onClose: () => void }) {
-  return <form className="modal compact" onSubmit={onSubmit}><ModalHead title="Novo tipo" subtitle="Crie uma nova categoria de equipamento." onClose={onClose} /><label>Nome do tipo<input name="name" placeholder="Ex.: Câmera fotográfica" autoFocus required /></label><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Voltar</button><button className="primary">Salvar tipo</button></div></form>;
+function LocalFilesPreview({ files }: { files: File[] }) {
+  return <div className="span-2 local-previews">{files.map((file) => <LocalFilePreview file={file} key={`${file.name}-${file.size}-${file.lastModified}`} />)}</div>;
+}
+
+function LocalFilePreview({ file }: { file: File }) {
+  const url = useMemo(() => file.type.startsWith("image/") ? URL.createObjectURL(file) : "", [file]);
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+  return <div>{url ? <img src={url} alt={`Prévia de ${file.name}`} /> : <span className="pdf-preview">PDF</span>}<p><b>{file.name}</b><small>{bytes(file.size)}</small></p></div>;
+}
+
+function StoreForm({ store, states, onSubmit, onClose }: { store?: Store; states: string[]; onSubmit: (e: FormEvent<HTMLFormElement>) => void; onClose: () => void }) {
+  return <form className="modal" onSubmit={onSubmit}><ModalHead title={store ? "Editar loja" : "Cadastrar loja"} subtitle={store ? "Todas as alterações serão registradas na auditoria." : "Adicione uma nova unidade ao sistema."} onClose={onClose} /><div className="form-grid"><label className="span-2">Nome da loja<input name="name" defaultValue={store?.name} placeholder="Ex.: Loja Aram" required /></label><label>Estado (sigla)<input name="state" defaultValue={store?.state} maxLength={2} pattern="[A-Za-z]{2}" placeholder="RN" list="states" required /><datalist id="states">{states.map((state) => <option key={state}>{state}</option>)}</datalist></label><label>Cidade (opcional)<input name="city" defaultValue={store?.city} placeholder="Natal" /></label><label className="span-2">Endereço (opcional)<input name="address" defaultValue={store?.address} placeholder="Rua, número e bairro" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">{store ? "Salvar alterações" : "Cadastrar loja"}</button></div></form>;
+}
+
+function TypeManager({ types, onAdd, onEdit, onDelete, onClose }: { types: EquipmentType[]; onAdd: (value: string) => void | Promise<void>; onEdit: (type: EquipmentType, value: string) => void | Promise<void>; onDelete: (type: EquipmentType) => void | Promise<void>; onClose: () => void }) {
+  const [name, setName] = useState("");
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+  return <section className="modal compact"><ModalHead title="Gerenciar tipos" subtitle="Cadastre, renomeie ou exclua categorias sem uso." onClose={onClose} /><form className="type-add" onSubmit={(e) => { e.preventDefault(); if (name.trim()) { void onAdd(name); setName(""); } }}><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex.: Câmera fotográfica" required /><button className="primary">Adicionar</button></form><div className="type-list">{types.map((type) => <div key={type.id}>{editingId === type.id ? <input value={draft} onChange={(e) => setDraft(e.target.value)} autoFocus /> : <b>{type.name}</b>}<span>{editingId === type.id ? <><button onClick={() => { void onEdit(type, draft); setEditingId(null); }}>Salvar</button><button onClick={() => setEditingId(null)}>Cancelar</button></> : <><button onClick={() => { setEditingId(type.id); setDraft(type.name); }}>Editar</button><button className="danger-link" onClick={() => void onDelete(type)}>Excluir</button></>}</span></div>)}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>Voltar</button></div></section>;
 }
 
 function ModalHead({ title, subtitle, onClose }: { title: string; subtitle: string; onClose: () => void }) { return <div className="modal-head"><div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" onClick={onClose}>×</button></div>; }
 
-function Details({ item, store, onClose, onToggle, onWarrantyAction }: { item: Equipment; store?: Store; onClose: () => void; onToggle: () => void; onWarrantyAction: (action: "start" | "end") => void }) {
+function DocumentPreview({ file, onClose }: { file: Attachment; onClose: () => void }) {
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    if (!supabase || !file.path) {
+      queueMicrotask(() => setError("Arquivo não encontrado."));
+      return () => { active = false; };
+    }
+    void supabase.storage.from(documentsBucket).download(file.path).then(({ data, error: downloadError }) => {
+      if (!active) return;
+      if (downloadError || !data) setError("Não foi possível carregar a prévia.");
+      else { objectUrl = URL.createObjectURL(data); setUrl(objectUrl); }
+    });
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [file]);
+  return <div className="document-preview"><div><b>Prévia: {file.name}</b><button onClick={onClose}>Fechar prévia</button></div>{error ? <p className="form-error">{error}</p> : !url ? <p className="muted">Carregando prévia...</p> : file.type === "application/pdf" ? <iframe src={url} title={`Prévia de ${file.name}`} /> : <img src={url} alt={`Prévia de ${file.name}`} />}</div>;
+}
+
+function Details({ item, store, onClose, onEdit, onToggle, onWarrantyAction }: { item: Equipment; store?: Store; onClose: () => void; onEdit: () => void; onToggle: () => void; onWarrantyAction: (action: "start" | "end") => void }) {
   const state = equipmentWarrantyState(item);
-  return <section className="modal large details"><ModalHead title={item.name} subtitle={`${item.type} · ${item.serial}`} onClose={onClose} /><div className="details-top"><span className={`pill ${item.active ? "success" : "neutral"}`}>{item.active ? "Equipamento ativo" : "Equipamento inativo"}</span><span className={`pill ${state.className}`}>{state.label}</span>{item.extendedWarrantyEnd && <span className="pill extended">Garantia estendida</span>}</div><div className="detail-grid"><div><span>Loja</span><b>{store?.name}</b><small>{store?.city} · {store?.state}</small></div><div><span>Número de série</span><b className="serial">{item.serial}</b></div><div><span>Data da compra</span><b>{formatDate(item.purchaseDate)}</b></div><div><span>Valor</span><b>{money(item.value)}</b></div><div><span>Início da garantia</span><b>{formatDate(item.warrantyStart)}</b></div><div><span>Término da garantia</span><b>{formatDate(item.warrantyEnd)}</b>{item.extendedWarrantyEnd && <small>Estendida até {formatDate(item.extendedWarrantyEnd)}</small>}</div></div><div className="documents"><h3>Documentos anexados</h3>{item.attachments.length ? item.attachments.map((file) => <div className="document" key={file.id}><span>▤</span><div><b>{file.name}</b><small>{file.kind} · {bytes(file.size)}</small></div><button onClick={() => viewDocument(file)}>Abrir</button></div>) : <p className="muted">Nenhum documento anexado.</p>}</div>{item.notes && <div className="notes"><span>Observações</span><p>{item.notes}</p></div>}<div className="modal-actions detail-actions"><button className={item.active ? "danger-button" : "secondary"} onClick={onToggle}>{item.active ? "Mover para inativos" : "Reativar equipamento"}</button><div><button className="warranty-button start" onClick={() => onWarrantyAction("start")}>Iniciar garantia</button><button className="warranty-button end" onClick={() => onWarrantyAction("end")}>Encerrar garantia</button><button className="primary" onClick={onClose}>Fechar</button></div></div></section>;
+  const [preview, setPreview] = useState<Attachment | null>(null);
+  return <section className="modal large details"><ModalHead title={item.name} subtitle={`${item.type} · ${item.serial}`} onClose={onClose} /><div className="details-top"><span className={`pill ${item.active ? "success" : "neutral"}`}>{item.active ? "Equipamento ativo" : "Equipamento inativo"}</span><span className={`pill ${state.className}`}>{state.label}</span>{item.extendedWarrantyEnd && <span className="pill extended">Garantia estendida</span>}<button className="edit-detail" onClick={onEdit}>Editar todas as informações</button></div><div className="detail-grid"><div><span>Loja</span><b>{store?.name}</b><small>{store?.city} · {store?.state}</small></div><div><span>Número de série</span><b className="serial">{item.serial}</b></div><div><span>Data da compra</span><b>{formatDate(item.purchaseDate)}</b></div><div><span>Valor</span><b>{money(item.value)}</b></div><div><span>Início da garantia</span><b>{formatDate(item.warrantyStart)}</b></div><div><span>Término da garantia</span><b>{formatDate(item.warrantyEnd)}</b>{item.extendedWarrantyEnd && <small>Estendida até {formatDate(item.extendedWarrantyEnd)}</small>}</div></div><div className="documents"><h3>Documentos anexados</h3>{item.attachments.length ? item.attachments.map((file) => <div className="document" key={file.id}><span>▤</span><div><b>{file.name}</b><small>{file.kind} · {bytes(file.size)} {file.referenceCode ? `· ${file.referenceCode}` : ""}</small></div><div className="document-actions"><button onClick={() => setPreview(file)}>Pré-visualizar</button><button onClick={() => viewDocument(file)}>Abrir</button></div></div>) : <p className="muted">Nenhum documento anexado.</p>}</div>{preview && <DocumentPreview file={preview} onClose={() => setPreview(null)} />}{item.notes && <div className="notes"><span>Observações</span><p>{item.notes}</p></div>}<div className="modal-actions detail-actions"><button className={item.active ? "danger-button" : "secondary"} onClick={onToggle}>{item.active ? "Mover para inativos" : "Reativar equipamento"}</button><div><button className="warranty-button start" onClick={() => onWarrantyAction("start")}>Iniciar garantia</button><button className="warranty-button end" onClick={() => onWarrantyAction("end")}>Encerrar garantia</button><button className="primary" onClick={onClose}>Fechar</button></div></div></section>;
 }
